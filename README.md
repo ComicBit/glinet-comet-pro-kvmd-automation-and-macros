@@ -1,4 +1,4 @@
-# GL.iNet Comet Pro KVMD Automation Guide (API, ATX, WebTerm, SSH, Macros) 🧠🔌
+# GL.iNet Comet Pro KVMD Automation Guide (API, ATX board, WebTerm, SSH, Macros) 🧠🔌
 
 This guide is a practical, copy-pasteable walkthrough for automating a **GL.iNet Comet Pro** (KVMD-based KVM).
 
