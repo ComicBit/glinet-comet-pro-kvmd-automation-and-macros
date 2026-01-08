@@ -1,13 +1,11 @@
 # GL.iNet Comet Pro KVMD Automation Guide (API, ATX, WebTerm, SSH, Macros) 🧠🔌
 
-This guide is a practical, copy-pasteable walkthrough for automating a **GL.iNet Comet Pro** (KVMD-based KVM). It covers:
+This guide is a practical, copy-pasteable walkthrough for automating a **GL.iNet Comet Pro** (KVMD-based KVM).
 
-* KVMD **HTTPS API** for HID (keyboard and mouse), text typing, and ATX power control
-* The **nginx rewrites** needed to expose missing `/api/...` endpoints
-* **SSH access** (Dropbear) for reliable “run macro script” automation
-* The built-in **Web Terminal** (“webterm”, `ttyd`) and how it’s wired
+It focuses on **what actually works** on the Comet Pro firmware today and how to wire it together cleanly for automation (especially from **iOS Shortcuts**).
 
-The goal: trigger robust multi-step KVM macros from **iOS Shortcuts** or any client that can run an SSH command.
+> **Compatibility note**
+> Some of this may also work on other GL.iNet KVMD-based devices, but this is **untested**. Endpoints, paths, and nginx configs may differ across models and firmware versions.
 
 ---
 
@@ -17,9 +15,8 @@ You can automate things like:
 
 * Type text into the target machine (BIOS, OS, login prompts)
 * Press single keys, shortcuts, sequences, or spam keys (example: `Delete` during reboot)
-* Move/click mouse (absolute/relative/wheel)
-* Press ATX buttons (power, long power press, reset) through the Comet Pro ATX board
-* Run “macros” from iOS Shortcuts by SSH-ing into the Comet Pro and executing scripts
+* Press ATX buttons (power, long power press, reset)
+* Trigger complex, multi-step macros over **SSH**
 
 ---
 
@@ -34,16 +31,20 @@ The Comet Pro runs:
   * KVMD backend: `/run/kvmd/kvmd.sock`
   * Web terminal (`ttyd`): `/run/kvmd/ttyd.sock`
 
-nginx exposes “friendly” `/api/...` routes and rewrites them to KVMD internal routes like `/hid/...`.
+By default, **not all KVMD endpoints are exposed under `/api/...`**. Some useful internal routes exist only as `/hid/...` and must be explicitly proxied by nginx.
 
 ---
 
-## Security warnings 🔒
+## Security and persistence warnings 🔒⚠️
 
 * Do **not** expose the Comet Pro directly to the public internet.
 * Prefer LAN-only access or a VPN (Tailscale, WireGuard).
 * Use strong credentials.
-* Prefer key-based SSH auth for admin machines.
+* Prefer key-based SSH auth.
+* **nginx changes are firmware-dependent and may be lost on updates.**
+
+  * Keep a backup of modified config files.
+  * Expect to re-apply changes after firmware upgrades.
 
 ---
 
@@ -54,175 +55,235 @@ nginx exposes “friendly” `/api/...` routes and rewrites them to KVMD interna
 For the Comet Pro KVMD API, Basic Auth uses:
 
 * **Username:** `admin`
-* **Password:** the **same UI password** you set during the device’s first-time setup
+* **Password:** the **same UI password** set during first-time setup
 
-In examples below we’ll refer to these as:
+Examples below assume:
 
 * `KVM_USER=admin`
 * `KVM_PASS=<your-ui-password>`
 
 ### TLS / self-signed certs
 
-The Comet Pro typically uses a self-signed TLS cert, so for `curl` you will usually need:
+The Comet Pro uses a self-signed TLS certificate. For `curl`, you will usually need:
 
 * `-k` / `--insecure`
 
 ---
 
-## 2) Access methods: Web UI, WebTerm, SSH 🧭
+## 2) First step: expose missing KVMD endpoints (required) 🛠️
+
+### Why this is necessary
+
+Several KVMD endpoints exist internally but are **not mapped under `/api/...` by default**. For example:
+
+* `/hid/events/send_key`
+* `/hid/events/send_shortcut`
+
+The web UI can reach them internally, but external automation cannot until nginx rewrites are added.
+
+> **Important:** Do this **before** trying any HID automation examples.
+
+---
+
+### 2.1 Where nginx configs live
+
+Common locations on the Comet Pro:
+
+* `/etc/kvmd/nginx/`
+* Server context:
+
+  * `/etc/kvmd/nginx/kvmd.ctx-server.conf`
+  * or `/etc/kvmd/nginx/gl.ctx-server.conf`
+* Upstream definition:
+
+  * `/etc/kvmd/nginx/kvmd.ctx-http.conf`
+
+Example upstream (usually already present):
+
+```nginx
+upstream kvmd {
+    server unix:/run/kvmd/kvmd.sock fail_timeout=0s max_fails=0;
+}
+```
+
+---
+
+### 2.2 Expose required HID endpoints
+
+Add the following `location` blocks:
+
+```nginx
+location /api/hid/events/send_key {
+    rewrite ^/api/hid/events/send_key$ /hid/events/send_key break;
+    rewrite ^/api/hid/events/send_key\?(.*)$ /hid/events/send_key?$1 break;
+    proxy_pass http://kvmd;
+    include /etc/kvmd/nginx/loc-proxy.conf;
+    include /etc/kvmd/nginx/loc-login.conf;
+    include /etc/kvmd/nginx/loc-nocache.conf;
+}
+
+location /api/hid/events/send_shortcut {
+    rewrite ^/api/hid/events/send_shortcut$ /hid/events/send_shortcut break;
+    rewrite ^/api/hid/events/send_shortcut\?(.*)$ /hid/events/send_shortcut?$1 break;
+    proxy_pass http://kvmd;
+    include /etc/kvmd/nginx/loc-proxy.conf;
+    include /etc/kvmd/nginx/loc-login.conf;
+    include /etc/kvmd/nginx/loc-nocache.conf;
+}
+```
+
+Restart nginx (method depends on firmware):
+
+```sh
+/etc/init.d/nginx restart
+```
+
+or:
+
+```sh
+systemctl restart nginx
+```
+
+---
+
+## 3) Access methods: Web UI, WebTerm, SSH 🧭
 
 ### Web UI
 
-Open the Comet Pro in a browser, login, and confirm:
+Use the Web UI to confirm:
 
 * video capture works
 * keyboard works
 * ATX buttons work
 
-### Web terminal (“webterm”)
+### Web terminal (webterm)
 
-The web terminal is an **embedded `ttyd`** instance proxied by nginx. It’s useful for debugging, but not the best automation primitive.
+The Web Terminal is an embedded **`ttyd`** instance proxied by nginx.
 
-Relevant wiring (on the device):
+It is useful for debugging but **not recommended for automation**.
 
-* nginx server location: `/usr/share/kvmd/extras/webterm/nginx.ctx-server.conf`
-* nginx upstream: `/usr/share/kvmd/extras/webterm/nginx.ctx-http.conf`
+Key wiring:
+
+* nginx config: `/usr/share/kvmd/extras/webterm/nginx.ctx-server.conf`
 * upstream socket: `/run/kvmd/ttyd.sock`
 
-This typically means a websocket endpoint under:
+Endpoint:
 
-* `wss://<host>/extras/webterm/ttyd/ws`
+* `https://<host>/extras/webterm/ttyd/`
 
-### SSH (recommended for automation)
+### SSH (recommended)
 
-Comet Pro commonly runs **Dropbear** SSH server on port 22.
+Comet Pro runs **Dropbear** on port 22.
 
-SSH is the cleanest way to run macros:
+SSH is the cleanest automation primitive:
 
-* iOS Shortcuts can run a single SSH command
-* you avoid handling cookies/websockets/terminal state
+* iOS Shortcuts can run one SSH command
+* No cookies, WebSockets, or terminal state
 
 ---
 
-## 3) Fixing SSH so automation is sane 🔑
+## 4) Fix SSH for automation 🔑
 
-### 3.1 Set a known root password
+### 4.1 Set a known root password
 
-If you don’t know the current root password, use WebTerm to set it:
+From WebTerm:
 
 ```sh
 passwd
 ```
 
-Use a strong password.
-
-### 3.2 Add SSH keys (recommended)
-
-On your Mac/Linux:
+### 4.2 Add SSH keys (recommended)
 
 ```sh
 ssh-keygen -t ed25519 -C "comet-pro"
-```
-
-Copy to the Comet Pro:
-
-```sh
 ssh root@<host> "mkdir -p /root/.ssh && chmod 700 /root/.ssh"
 scp ~/.ssh/id_ed25519.pub root@<host>:/root/.ssh/authorized_keys
 ssh root@<host> "chmod 600 /root/.ssh/authorized_keys"
 ```
 
-If iOS Shortcuts is your main client, you might still use password auth there, but keys are strongly recommended for your admin machines.
-
 ---
 
-## 4) KVMD HID API (keyboard, typing, mouse) ⌨️🖱️
+## 5) KVMD HID API (keyboard + typing) ⌨️
 
-### Critical gotcha: many HID endpoints read from URL query params
+### Critical gotcha: query-string parameters only
 
-On this Comet Pro build, handlers like `send_key` read `req.query.get("key")`.
+On this Comet Pro build, HID handlers like `send_key` read parameters from the **URL query string**, not JSON bodies.
 
-That means **JSON body won’t work**, and you’ll get errors like:
+If `key` is missing from the query, you will see:
 
 * `None argument is not a valid Keyboard key`
 
-✅ Working format (query string):
-
-```sh
-curl -k -u "admin:<UI_PASSWORD>" -X POST \
-  "https://<host>/api/hid/events/send_key?key=ArrowUp&state=1&finish=1"
-```
-
 ---
 
-### 4.1 Type text
+### 5.1 Type text
 
-**Endpoint:**
-
-* `POST /api/hid/print`
-
-**Body:** raw text
+* Endpoint: `POST /api/hid/print`
+* Body: raw text
 
 Example:
 
 ```sh
-curl -k -u "admin:<UI_PASSWORD>" -X POST "https://<host>/api/hid/print" \
-  --data-binary "cmd"
+curl -k -u admin:PASS -X POST https://kvm/api/hid/print \
+  --data-binary 'cmd'
 ```
 
 ---
 
-### 4.2 Send a single key event
+### 5.2 Send a key event
 
-**Endpoint:**
+* Endpoint: `POST /api/hid/events/send_key`
+* Query params:
 
-* `POST /api/hid/events/send_key`
+  * `key=<KeyName>`
+  * `state=1` (down) or `state=0` (up)
+  * optional `finish=1`
 
-**Query params:**
-
-* `key=<KeyboardEvent.code>`
-* `state=1` (press) or `state=0` (release)
-* `finish=1` (optional, helps finalize sequences)
-
-Tap a key (press then release):
+Example (tap Enter):
 
 ```sh
-curl -k -u "admin:<UI_PASSWORD>" -X POST \
-  "https://<host>/api/hid/events/send_key?key=Enter&state=1"
-
-curl -k -u "admin:<UI_PASSWORD>" -X POST \
-  "https://<host>/api/hid/events/send_key?key=Enter&state=0&finish=1"
+curl -k -u admin:PASS -X POST \
+  'https://kvm/api/hid/events/send_key?key=Enter&state=1'
+curl -k -u admin:PASS -X POST \
+  'https://kvm/api/hid/events/send_key?key=Enter&state=0&finish=1'
 ```
 
 ---
 
-### 4.3 Send a shortcut (optional)
+### 5.3 Shortcuts (manual pattern)
 
-If you exposed `send_shortcut` via nginx (see below), you can call:
+Recommended sequence:
 
-* `POST /api/hid/events/send_shortcut?keys=...`
+1. modifier down
+2. main key tap
+3. modifier up (reverse order)
 
-Safest form is repeating params:
+Example (Ctrl+Alt+Delete):
 
 ```sh
-curl -k -u "admin:<UI_PASSWORD>" -X POST \
-  "https://<host>/api/hid/events/send_shortcut?keys=ControlLeft&keys=AltLeft&keys=Delete"
+curl -k -u admin:PASS -X POST \
+  'https://kvm/api/hid/events/send_key?key=ControlLeft&state=1'
+curl -k -u admin:PASS -X POST \
+  'https://kvm/api/hid/events/send_key?key=AltLeft&state=1'
+
+curl -k -u admin:PASS -X POST \
+  'https://kvm/api/hid/events/send_key?key=Delete&state=1'
+curl -k -u admin:PASS -X POST \
+  'https://kvm/api/hid/events/send_key?key=Delete&state=0&finish=1'
+
+curl -k -u admin:PASS -X POST \
+  'https://kvm/api/hid/events/send_key?key=AltLeft&state=0&finish=1'
+curl -k -u admin:PASS -X POST \
+  'https://kvm/api/hid/events/send_key?key=ControlLeft&state=0&finish=1'
 ```
 
 ---
 
-### 4.4 Mouse (overview)
+## 6) Supported keys (Comet Pro build) 🎛️
 
-KVMD supports mouse endpoints (button, absolute move, relative move, wheel). Names can vary by build. The practical way is to inspect the server or web UI requests and expose those endpoints the same way you exposed HID keys.
-
----
-
-## 5) Supported keys legend (Comet Pro build) 🎛️
-
-This is the **full list of supported keys** dumped from the device:
+<details>
+<summary><strong>Full supported key list</strong></summary>
 
 ```text
-Total keys: 115
 KeyA
 KeyB
 KeyC
@@ -340,116 +401,47 @@ AudioVolumeDown
 F20
 ```
 
----
-
-## 6) ATX API (Comet Pro power board) ⚡️
-
-### 6.1 Read ATX state
-
-```sh
-curl -k -u "admin:<UI_PASSWORD>" "https://<host>/api/atx"
-```
-
-### 6.2 The endpoint the web UI actually uses: `/api/atx/click`
-
-This is the reliable control route on Comet Pro:
-
-* `POST /api/atx/click?button=<button>`
-
-Observed working example:
-
-```sh
-curl -k -u "admin:<UI_PASSWORD>" -X POST \
-  "https://<host>/api/atx/click?button=power"
-```
-
-Common button values typically include:
-
-* `power` (short press)
-* `power_long` (long press)
-* `reset`
-
-### 6.3 `/api/atx/power?action=...` (device-dependent)
-
-Some builds expose an action-based endpoint, but on this Comet Pro build it was not reliable for actual physical action. Prefer `/api/atx/click`.
+</details>
 
 ---
 
-## 7) Exposing missing endpoints under `/api/...` (nginx) 🛠️
+## 7) ATX API (Comet Pro power board) ⚡️
 
-### Why you need this
+The Comet Pro exposes ATX controls under `/api/atx`. These map **directly to the same actions used by the web UI**.
 
-Some endpoints exist internally at KVMD paths like:
-
-* `/hid/events/send_key`
-* `/hid/events/send_shortcut`
-
-…but are not mapped under `/api/...` by default.
-
-### Where configs live
-
-* `/etc/kvmd/nginx/`
-* common server ctx: `/etc/kvmd/nginx/kvmd.ctx-server.conf` and/or `/etc/kvmd/nginx/gl.ctx-server.conf`
-* upstream definition: `/etc/kvmd/nginx/kvmd.ctx-http.conf`
-
-Example upstream:
-
-```nginx
-upstream kvmd {
-    server unix:/run/kvmd/kvmd.sock fail_timeout=0s max_fails=0;
-}
-```
-
-### Example: expose `send_key` and `send_shortcut`
-
-Add blocks like:
-
-```nginx
-location /api/hid/events/send_key {
-    rewrite ^/api/hid/events/send_key$ /hid/events/send_key break;
-    rewrite ^/api/hid/events/send_key\?(.*)$ /hid/events/send_key?$1 break;
-    proxy_pass http://kvmd;
-    include /etc/kvmd/nginx/loc-proxy.conf;
-    include /etc/kvmd/nginx/loc-login.conf;
-    include /etc/kvmd/nginx/loc-nocache.conf;
-}
-
-location /api/hid/events/send_shortcut {
-    rewrite ^/api/hid/events/send_shortcut$ /hid/events/send_shortcut break;
-    rewrite ^/api/hid/events/send_shortcut\?(.*)$ /hid/events/send_shortcut?$1 break;
-    proxy_pass http://kvmd;
-    include /etc/kvmd/nginx/loc-proxy.conf;
-    include /etc/kvmd/nginx/loc-login.conf;
-    include /etc/kvmd/nginx/loc-nocache.conf;
-}
-```
-
-Restart nginx (command depends on firmware):
+### Read ATX state
 
 ```sh
-/etc/init.d/nginx restart
+curl -k -u admin:PASS https://kvm/api/atx
 ```
 
-or:
+### Click ATX buttons
+
+* `POST /api/atx/click?button=power`
+* `POST /api/atx/click?button=power_long`
+* `POST /api/atx/click?button=reset`
+
+Example:
 
 ```sh
-systemctl restart nginx
+curl -k -u admin:PASS -X POST \
+  'https://kvm/api/atx/click?button=power'
 ```
+
+> Some firmware builds expose `/api/atx/power?action=...`, but on the Comet Pro this was unreliable. Prefer `/api/atx/click`.
 
 ---
 
-## 8) Recommended automation pattern (what you should actually do) 🤖
+## 8) Recommended automation pattern 🤖
 
-### 8.1 Put macros on the Comet Pro
+### Put macros on the Comet Pro
 
 ```sh
 mkdir -p /root/macros
 chmod 700 /root/macros
 ```
 
-### 8.2 Use a generic script template
-
-Create `/root/macros/example.sh`:
+### Example macro template
 
 ```sh
 #!/bin/sh
@@ -472,96 +464,21 @@ tap_key() {
   $CURL -X POST "$BASE/api/hid/events/send_key?key=$key&state=0&finish=1" >/dev/null
 }
 
-countdown() {
-  label="$1"
-  seconds="$2"
-  while [ "$seconds" -gt 0 ]; do
-    echo "[*] $label: ${seconds}s remaining"
-    sleep 1
-    seconds=$((seconds - 1))
-  done
-}
-
-echo "[*] Example macro starting"
 hid_print "hello from kvmd"
 tap_key "Enter"
-countdown "Waiting" 3
-echo "[+] Done"
 ```
 
-Enable it:
+Trigger via SSH (iOS Shortcuts):
 
 ```sh
-chmod +x /root/macros/example.sh
+KVM_PASS='<ui-password>' /root/macros/example.sh
 ```
-
-### 8.3 Trigger from iOS Shortcuts
-
-Use the Shortcuts action: **Run Script over SSH**
-
-Command example:
-
-```sh
-KVM_PASS='<your-ui-password>' /root/macros/example.sh
-```
-
-This avoids browser state, cookies, and websockets.
 
 ---
 
 ## 9) Troubleshooting 🧯
 
-### 404 Not Found on `/api/hid/events/send_key`
-
-nginx does not expose it yet.
-
-* Add nginx `location` rewrite blocks.
-* Restart nginx.
-
-### 405 Method Not Allowed
-
-You used `GET`. Use `POST`.
-
-### “None argument is not a valid Keyboard key”
-
-Your request did not include `key` in the query string.
-
-Use:
-
-* `...?key=ArrowUp&state=1`
-
-### ATX returns ok but does nothing
-
-Use:
-
-* `/api/atx/click?button=...`
-
-Not all builds implement action-based `/api/atx/power?action=...` reliably.
-
----
-
-## Appendix: Quick command cheatsheet 📌
-
-### Type text
-
-```sh
-curl -k -u "admin:<UI_PASSWORD>" -X POST "https://<host>/api/hid/print" \
-  --data-binary "cmd"
-```
-
-### Tap a key
-
-```sh
-curl -k -u "admin:<UI_PASSWORD>" -X POST \
-  "https://<host>/api/hid/events/send_key?key=Enter&state=1"
-
-curl -k -u "admin:<UI_PASSWORD>" -X POST \
-  "https://<host>/api/hid/events/send_key?key=Enter&state=0&finish=1"
-```
-
-### ATX short press power
-
-```sh
-curl -k -u "admin:<UI_PASSWORD>" -X POST \
-  "https://<host>/api/atx/click?button=power"
-```
+* **404 on `/api/hid/...`**: nginx rewrite missing or lost after update
+* **405 Method Not Allowed**: wrong HTTP method (must be `POST`)
+* **Invalid key error**: `key` missing from query string
+* **ATX does nothing**: use `/api/atx/click`, not action-based endpoints
