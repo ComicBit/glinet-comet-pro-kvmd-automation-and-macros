@@ -57,11 +57,6 @@ For the Comet Pro KVMD API, Basic Auth uses:
 * **Username:** `admin`
 * **Password:** the **same UI password** set during first-time setup
 
-Examples below assume:
-
-* `KVM_USER=admin`
-* `KVM_PASS=<your-ui-password>`
-
 ### TLS / self-signed certs
 
 The Comet Pro uses a self-signed TLS certificate. For `curl`, you will usually need:
@@ -407,7 +402,7 @@ F20
 
 ## 7) ATX API (Comet Pro power board) ⚡️
 
-The Comet Pro exposes ATX controls under `/api/atx`. These map **directly to the same actions used by the web UI**.
+The Comet Pro exposes ATX controls under `/api/atx`. These map directly to the same actions used by the web UI.
 
 ### Read ATX state
 
@@ -434,22 +429,21 @@ curl -k -u admin:PASS -X POST \
 
 ## 8) Recommended automation pattern 🤖
 
-### Put macros on the Comet Pro
+For macros, store scripts under `/usr/share/kvmd/extras/scripts/` and call them via SSH.
+
+### 8.1 Create a script directly (copy-paste)
+
+This creates a minimal macro that types a string and presses Enter.
 
 ```sh
-mkdir -p /root/macros
-chmod 700 /root/macros
-```
-
-### Example macro template
-
-```sh
+mkdir -p /usr/share/kvmd/extras/scripts
+cat > /usr/share/kvmd/extras/scripts/hello-print-enter.sh <<'SH'
 #!/bin/sh
 set -eu
 
-BASE="${BASE:-https://127.0.0.1}"
-KVM_USER="${KVM_USER:-admin}"
-KVM_PASS="${KVM_PASS:-CHANGE_ME}"
+BASE="https://127.0.0.1"
+KVM_USER="admin"
+KVM_PASS="CHANGE_ME"
 
 CURL="curl -fsS -k -u ${KVM_USER}:${KVM_PASS}"
 
@@ -466,12 +460,17 @@ tap_key() {
 
 hid_print "hello from kvmd"
 tap_key "Enter"
+SH
+chmod +x /usr/share/kvmd/extras/scripts/hello-print-enter.sh
+echo OK
 ```
 
-Trigger via SSH (iOS Shortcuts):
+### 8.2 Trigger via SSH (iOS Shortcuts)
+
+Because the password is stored inside the script, you can run it directly:
 
 ```sh
-KVM_PASS='<ui-password>' /root/macros/example.sh
+/usr/share/kvmd/extras/scripts/hello-print-enter.sh
 ```
 
 ---
